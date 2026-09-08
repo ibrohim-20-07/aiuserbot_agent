@@ -52,6 +52,7 @@ LAYER_LABELS = {
     "error": "⚠️ Xato",
     "skipped": "🚫 Javob berilmadi",
     "paused": "⏸ Avto-pauza (siz faol edingiz)",
+    "owner": "👤 Siz (qo'lda javob)",
 }
 
 
@@ -237,15 +238,31 @@ class ArchiveService:
         full_name: str | None,
         username: str | None,
         is_new: bool = False,
+        phone: str | None = None,
+        is_premium: bool = False,
+        msg_id: int | None = None,
     ) -> str:
         name = html.escape(full_name or "Noma'lum")
         handle = f" (@{html.escape(username)})" if username else ""
         badge = " 🆕" if is_new else ""
-        stamp = dt.datetime.now().strftime("%d.%m %H:%M")
-        return (
-            f"👤 <b>{name}</b>{handle}{badge}\n"
-            f"<code>{user_id}</code> · <a href=\"tg://user?id={user_id}\">ochish</a> · {stamp}"
-        )
+        premium_badge = " ⭐ Premium" if is_premium else ""
+        stamp = dt.datetime.now().strftime("%d.%m %H:%M:%S")
+
+        lines = [f"👤 <b>{name}</b>{handle}{badge}{premium_badge}"]
+        extra_parts = [
+            f"<code>{user_id}</code>",
+            f'<a href="tg://user?id={user_id}">ochish</a>',
+            stamp,
+        ]
+        if msg_id:
+            extra_parts.append(f"#{msg_id}")
+        lines.append(" · ".join(extra_parts))
+
+        if phone:
+            norm_phone = phone if str(phone).startswith("+") else f"+{phone}"
+            lines.append(f"📞 Telefon: <code>{html.escape(norm_phone)}</code>")
+
+        return "\n".join(lines)
 
     def log_exchange(
         self,
@@ -256,16 +273,57 @@ class ArchiveService:
         reply: str | None,
         layer: str,
         is_new: bool = False,
+        phone: str | None = None,
+        is_premium: bool = False,
+        msg_id: int | None = None,
+        media_type: str | None = None,
     ) -> None:
         """Bitta almashinuvni (kiruvchi + javob) kanalga navbatga qo'yadi."""
-        parts = [self._header(user_id, full_name, username, is_new)]
-        parts.append(f"\n💬 <b>Mijoz:</b>\n{html.escape(_clip(incoming))}")
+        parts = [
+            self._header(
+                user_id,
+                full_name,
+                username,
+                is_new=is_new,
+                phone=phone,
+                is_premium=is_premium,
+                msg_id=msg_id,
+            )
+        ]
+        media_tag = f" <i>[{media_type.capitalize()}]</i>" if media_type else ""
+        parts.append(f"\n💬 <b>Mijoz{media_tag}:</b>\n{html.escape(_clip(incoming))}")
         label = LAYER_LABELS.get(layer, layer)
         if reply:
             parts.append(f"\n<b>{label}:</b>\n{html.escape(_clip(reply))}")
         else:
             parts.append(f"\n{label}")
         self._enqueue("\n".join(parts))
+
+    def log_deleted_message(
+        self,
+        user_id: int,
+        full_name: str | None,
+        username: str | None,
+        deleted_text: str,
+        msg_id: int | None = None,
+        phone: str | None = None,
+    ) -> None:
+        """O'chirilgan xabar haqida ogohlantirishni kanalga navbatga qo'yadi."""
+        name = html.escape(full_name or "Noma'lum")
+        handle = f" (@{html.escape(username)})" if username else ""
+        stamp = dt.datetime.now().strftime("%d.%m %H:%M:%S")
+        phone_line = f"\n📞 Telefon: <code>{html.escape(phone)}</code>" if phone else ""
+        msg_tag = f" #{msg_id}" if msg_id else ""
+
+        text = (
+            f"🗑 <b>DIQQAT: XABAR O'CHIRILDI!</b>\n"
+            f"👤 <b>{name}</b>{handle}\n"
+            f"<code>{user_id}</code> · <a href=\"tg://user?id={user_id}\">ochish</a> · {stamp}{msg_tag}"
+            f"{phone_line}\n\n"
+            f"❌ <b>O'chirilgan xabar matni:</b>\n"
+            f"<i>{html.escape(_clip(deleted_text))}</i>"
+        )
+        self._enqueue(text)
 
     def log_note(self, text: str) -> None:
         """Xizmat xabari (ishga tushish, kanal yaratilishi va h.k.)."""

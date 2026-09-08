@@ -63,9 +63,8 @@ def _full_name(user: User) -> str:
     return " ".join(p for p in parts if p).strip() or "Noma'lum"
 
 
-def create_client() -> TelegramClient:
-    """Telethon mijozini yaratadi va hodisa tinglovchilarini ulaydi."""
-    client = TelegramClient(config.session_name, config.api_id, config.api_hash)
+def setup_handlers(client: TelegramClient) -> None:
+    """Telethon client hodisa tinglovchilarini ro'yxatdan o'tkazadi."""
 
     @client.on(events.NewMessage(incoming=True))
     async def on_private_message(event: events.NewMessage.Event) -> None:
@@ -77,18 +76,46 @@ def create_client() -> TelegramClient:
         if not isinstance(sender, User) or sender.bot or sender.is_self:
             return
 
-        text = normalize(event.raw_text or "")
+        # Media turini aniqlaymiz
+        media_type = None
+        if event.photo:
+            media_type = "rasm"
+        elif event.voice:
+            media_type = "ovozli xabar"
+        elif event.video or getattr(event, "video_note", None):
+            media_type = "video"
+        elif event.document:
+            media_type = "hujjat"
+        elif getattr(event, "sticker", None):
+            media_type = "stiker"
+
+        raw_text = event.raw_text or ""
+        text = normalize(raw_text)
+        if not text and media_type:
+            text = f"[{media_type.capitalize()}]"
+
         if is_service_message(text):
             return
 
         user_id = sender.id
         username = sender.username
         full_name = _full_name(sender)
+        phone = sender.phone
+        is_premium = 1 if getattr(sender, "premium", False) else 0
 
         # --- 2. Arxiv (javob berilmasa ham yoziladi) ---
         try:
-            is_new = await touch_contact(user_id, username, full_name)
-            await log_message(user_id, text, "in", username=username)
+            is_new = await touch_contact(
+                user_id, username, full_name, phone=phone, is_premium=is_premium
+            )
+            await log_message(
+                user_id,
+                text,
+                "in",
+                username=username,
+                msg_id=event.id,
+                media_type=media_type,
+            )
         except Exception:
             is_new = False
             logger.exception("Xabarni arxivlashda xato (user=%s)", user_id)
@@ -97,7 +124,17 @@ def create_client() -> TelegramClient:
             if reply:
                 await log_message(user_id, reply, "out", username=username, layer=layer)
             archive_service.log_exchange(
-                user_id, full_name, username, text, reply, layer, is_new
+                user_id,
+                full_name,
+                username,
+                text,
+                reply,
+                layer,
+                is_new=is_new,
+                phone=phone,
+                is_premium=bool(is_premium),
+                msg_id=event.id,
+                media_type=media_type,
             )
 
         # --- 3. Ruxsat ---
@@ -118,6 +155,8 @@ def create_client() -> TelegramClient:
         if await is_auto_pause_active():
             window = await get_auto_pause_minutes() * 60
             if presence_tracker.is_owner_active(window):
+                # Kontekst uzilib qolmasligi uchun bu xabarni ham Gemini xotirasiga yozib qo'yamiz!
+                gemini_service.remember_user(user_id, text)
                 await increment_stat("paused")
                 await archive(None, "paused")
                 logger.info(
@@ -166,32 +205,75 @@ def create_client() -> TelegramClient:
 
     @client.on(events.NewMessage(outgoing=True))
     async def on_own_message(event: events.NewMessage.Event) -> None:
-        """Egasining faolligini qayd etadi (avto-pauza uchun).
-
-        Istalgan qurilmadan yozilgan xabar hisobga olinadi. Bot o'zi
-        yuborgan xabarlar chetlatiladi (chat + matn yoki xabar ID bo'yicha).
-
-        Arxiv kanali ham shu akkauntdan to'ldiriladi — undagi yozuvlar
-        faollik deb sanalsa, AI o'z arxivi tufayli abadiy jim qolardi.
+        """Egasining faolligini qayd etadi (avto-pauza uchun) va egasining
+        qo'lda yozgan javoblarini Gemini kontekstiga qo'shadi.
         """
         if (
             archive_service.channel_id is not None
             and event.chat_id == archive_service.channel_id
         ):
             return
-        presence_tracker.note_outgoing(event.id, event.chat_id, event.raw_text or "")
 
-    return client
+        raw_text = event.raw_text or ""
+        is_owner = presence_tracker.note_outgoing(event.id, event.chat_id, raw_text)
+
+        # Agar bu botning o'zi yuborgan avtomatik xabar bo'lmasa va shaxsiy chat bo'lsa:
+        # demak bu egasining shaxsan o'zi yozgan xabari!
+        if is_owner and event.is_private:
+            user_id = event.chat_id
+            # Kontekstni Gemini ga eslatib qo'yamiz (keyinchalik AI bu javobni biladi)
+            gemini_service.remember_reply(user_id, raw_text)
+            # Bazaga ham saqlaymiz
+            try:
+                await log_message(
+                    user_id,
+                    raw_text,
+                    "out",
+                    layer="owner",
+                    msg_id=event.id,
+                )
+            except Exception:
+                logger.debug("Egasi javobini bazaga yozishda xato:", exc_info=True)
+
+    @client.on(events.MessageDeleted)
+    async def on_message_deleted(event: events.MessageDeleted.Event) -> None:
+        """O'chirilgan xabarlarni tutib, arxivga xabar beradi (Anti-Delete)."""
+        from ..database import mark_message_deleted
+
+        for deleted_id in event.deleted_ids:
+            try:
+                record = await mark_message_deleted(deleted_id)
+                if record:
+                    logger.info(
+                        "O'chirilgan xabar tutildi: msg_id=%s, user=%s",
+                        deleted_id,
+                        record["user_id"],
+                    )
+                    archive_service.log_deleted_message(
+                        user_id=record["user_id"],
+                        full_name=record["full_name"],
+                        username=record["username"],
+                        deleted_text=record["text"],
+                        msg_id=deleted_id,
+                        phone=record.get("phone"),
+                    )
+            except Exception:
+                logger.exception("O'chirilgan xabarni qayta ishlashda xato (id=%s):", deleted_id)
 
 
-async def run_userbot(client: TelegramClient) -> None:
-    """Userbotni ishga tushiradi va ulanish uzilgunicha kutadi."""
-    await client.start()
-    me = await client.get_me()
-    logger.info("Userbot ishga tushdi: @%s (id=%s)", me.username, me.id)
+from .manager import userbot_manager  # noqa: E402
 
-    # Arxiv kanalini akkauntning o'zi yaratadi/tiklaydi — qo'lda sozlash shart emas.
-    await archive_service.setup(client)
-    archive_service.log_note(f"Userbot ishga tushdi: @{me.username}")
+# Menejerga handlerlarni ulash funksiyasini taqdim etamiz
+userbot_manager.set_handlers_setup(setup_handlers)
 
-    await client.run_until_disconnected()
+
+def create_client() -> TelegramClient:
+    """Mavjud userbot clientini qaytaradi (orqaga moslik uchun)."""
+    assert userbot_manager.client is not None
+    return userbot_manager.client
+
+
+async def run_userbot(client: TelegramClient | None = None) -> None:
+    """Userbotni terminalda input so'ramaydigan xavfsiz holda ishga tushiradi."""
+    await userbot_manager.run()
+

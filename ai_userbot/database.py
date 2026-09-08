@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import Any
 
 import aiosqlite
 
@@ -55,10 +56,15 @@ DEFAULTS: dict[str, str] = {
     # Avto-pauza: egasi o'zi yozayotgan bo'lsa AI aralashmaydi.
     "auto_pause_active": "0",
     "auto_pause_minutes": "10",
+    # Kontekst hajmi: har bir suhbat uchun xotirada saqlanadigan xabarlar soni
+    "history_limit": "8",
 }
 
 # Avto-pauza uchun tanlanadigan oraliqlar (daqiqa).
 PAUSE_CHOICES = (5, 10, 30, 60)
+
+# Kontekst hajmi uchun tanlanadigan oraliqlar (xabarlar soni).
+CONTEXT_CHOICES = (4, 8, 12, 16)
 
 # Arxivdagi xabarlar shuncha kundan keyin tozalanadi.
 MESSAGE_RETENTION_DAYS = 90
@@ -92,6 +98,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     user_id    INTEGER PRIMARY KEY,
     username   TEXT,
     full_name  TEXT,
+    phone      TEXT,
+    is_premium INTEGER NOT NULL DEFAULT 0,
     first_seen TEXT NOT NULL,
     last_seen  TEXT NOT NULL,
     messages   INTEGER NOT NULL DEFAULT 0
@@ -99,17 +107,20 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 -- Barcha xabarlar arxivi (kanal o'chib ketsa ham baza saqlanadi)
 CREATE TABLE IF NOT EXISTS messages (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts        TEXT    NOT NULL,
-    day       TEXT    NOT NULL,
-    user_id   INTEGER NOT NULL,
-    username  TEXT,
-    direction TEXT    NOT NULL,
-    layer     TEXT,
-    text      TEXT    NOT NULL
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id     INTEGER,
+    ts         TEXT    NOT NULL,
+    day        TEXT    NOT NULL,
+    user_id    INTEGER NOT NULL,
+    username   TEXT,
+    direction  TEXT    NOT NULL,
+    layer      TEXT,
+    media_type TEXT,
+    text       TEXT    NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_messages_day  ON messages (day);
-CREATE INDEX IF NOT EXISTS idx_messages_user ON messages (user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_day     ON messages (day);
+CREATE INDEX IF NOT EXISTS idx_messages_user    ON messages (user_id);
 
 -- Token sarfi (kalitlar kesimida)
 CREATE TABLE IF NOT EXISTS token_usage (
@@ -139,6 +150,34 @@ async def init_db() -> None:
     """Jadvallarni yaratadi, standart qiymatlarni to'ldiradi, eskini tozalaydi."""
     async with aiosqlite.connect(config.db_path) as db:
         await db.executescript(_SCHEMA)
+
+        # Migratsiyalar: mavjud jadvallarga yangi ustunlarni xavfsiz qo'shish
+        for col, col_def in [
+            ("phone", "TEXT"),
+            ("is_premium", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE contacts ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
+        for col, col_def in [
+            ("msg_id", "INTEGER"),
+            ("media_type", "TEXT"),
+            ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE messages ADD COLUMN {col} {col_def}")
+            except Exception:
+                pass
+
+        try:
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages (msg_id)"
+            )
+        except Exception:
+            pass
+
         await db.executemany(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             list(DEFAULTS.items()),
@@ -214,6 +253,28 @@ async def get_auto_pause_minutes() -> int:
 
 async def set_auto_pause_minutes(minutes: int) -> None:
     await set_setting("auto_pause_minutes", str(max(1, minutes)))
+
+
+# --------------------------------------------------------------------- #
+# Kontekst hajmi (har bir suhbatdosh uchun oxirgi xabarlar soni)
+# --------------------------------------------------------------------- #
+async def get_history_limit() -> int:
+    try:
+        return max(2, int(await get_setting("history_limit", "8")))
+    except ValueError:
+        return 8
+
+
+async def set_history_limit(limit: int) -> None:
+    await set_setting("history_limit", str(max(2, limit)))
+
+
+async def get_db_message_count() -> int:
+    """Bazadagi jami xabarlar soni."""
+    async with aiosqlite.connect(config.db_path) as db:
+        async with db.execute("SELECT COUNT(*) FROM messages") as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
 
 # --------------------------------------------------------------------- #
@@ -313,7 +374,11 @@ async def check_access(user_id: int) -> tuple[bool, str]:
 # Kontaktlar
 # --------------------------------------------------------------------- #
 async def touch_contact(
-    user_id: int, username: str | None, full_name: str | None
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+    phone: str | None = None,
+    is_premium: int = 0,
 ) -> bool:
     """Kontaktni yangilaydi. Birinchi marta yozayotgan bo'lsa `True` qaytaradi."""
     now = _now()
@@ -323,12 +388,14 @@ async def touch_contact(
         ) as cur:
             is_new = await cur.fetchone() is None
         await db.execute(
-            "INSERT INTO contacts (user_id, username, full_name, first_seen, last_seen, messages) "
-            "VALUES (?, ?, ?, ?, ?, 1) "
+            "INSERT INTO contacts (user_id, username, full_name, phone, is_premium, first_seen, last_seen, messages) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "username = excluded.username, full_name = excluded.full_name, "
+            "phone = COALESCE(excluded.phone, contacts.phone), "
+            "is_premium = excluded.is_premium, "
             "last_seen = excluded.last_seen, messages = messages + 1",
-            (user_id, username, full_name, now, now),
+            (user_id, username, full_name, phone, is_premium, now, now),
         )
         await db.commit()
     return is_new
@@ -343,15 +410,73 @@ async def log_message(
     direction: str,
     username: str | None = None,
     layer: str | None = None,
+    msg_id: int | None = None,
+    media_type: str | None = None,
 ) -> None:
     """Xabarni bazaga yozadi (`direction`: in | out)."""
     async with aiosqlite.connect(config.db_path) as db:
         await db.execute(
-            "INSERT INTO messages (ts, day, user_id, username, direction, layer, text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_now(), _today(), user_id, username, direction, layer, text),
+            "INSERT INTO messages (ts, day, user_id, username, direction, layer, text, msg_id, media_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_now(), _today(), user_id, username, direction, layer, text, msg_id, media_type),
         )
         await db.commit()
+
+
+async def mark_message_deleted(msg_id: int, user_id: int | None = None) -> dict[str, Any] | None:
+    """O'chirilgan xabarni belgilaydi va uning ma'lumotlarini qaytaradi."""
+    async with aiosqlite.connect(config.db_path) as db:
+        query = (
+            "SELECT m.id, m.user_id, m.username, m.text, m.ts, m.media_type, "
+            "       c.full_name, c.phone "
+            "FROM messages m "
+            "LEFT JOIN contacts c ON c.user_id = m.user_id "
+            "WHERE m.msg_id = ? "
+        )
+        params: list[Any] = [msg_id]
+        if user_id is not None:
+            query += "AND m.user_id = ? "
+            params.append(user_id)
+        query += "ORDER BY m.id DESC LIMIT 1"
+
+        async with db.execute(query, params) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            return None
+
+        # is_deleted bayrog'ini 1 qilamiz
+        await db.execute("UPDATE messages SET is_deleted = 1 WHERE id = ?", (row[0],))
+        await db.commit()
+
+        return {
+            "id": row[0],
+            "user_id": row[1],
+            "username": row[2],
+            "text": row[3],
+            "ts": row[4],
+            "media_type": row[5],
+            "full_name": row[6] or "Noma'lum",
+            "phone": row[7],
+        }
+
+
+async def get_recent_messages(user_id: int, limit: int = 8) -> list[dict[str, str]]:
+    """Gemini kontekstini to'ldirish uchun oxirgi xabarlar tarixini oladi."""
+    async with aiosqlite.connect(config.db_path) as db:
+        async with db.execute(
+            "SELECT direction, text FROM messages "
+            "WHERE user_id = ? AND text IS NOT NULL AND text != '' "
+            "ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    results = []
+    for direction, text in reversed(rows):
+        role = "model" if direction == "out" else "user"
+        results.append({"role": role, "text": text})
+    return results
 
 
 # --------------------------------------------------------------------- #

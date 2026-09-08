@@ -28,11 +28,17 @@ def create_dispatcher() -> Dispatcher:
     return dp
 
 
+from ..userbot.manager import userbot_manager
+
+
 async def run_admin_bot(bot: Bot, dp: Dispatcher) -> None:
     """Adminni xabardor qilib, pollingni boshlaydi."""
     await bot.set_my_commands(
         [
             BotCommand(command="menu", description="Boshqaruv paneli"),
+            BotCommand(command="account", description="Akkaunt holati va boshqaruvi"),
+            BotCommand(command="login", description="Akkauntni ulash"),
+            BotCommand(command="logout", description="Akkauntni uzish"),
             BotCommand(command="start", description="Botni ishga tushirish"),
         ]
     )
@@ -42,12 +48,20 @@ async def run_admin_bot(bot: Bot, dp: Dispatcher) -> None:
     logger.info("Admin bot ishga tushdi: @%s", me.username)
 
     try:
-        # Kanal holati `/menu` da ko'rinadi — uni userbot tayyorlaydi.
+        is_auth = await userbot_manager.is_authorized()
+        if is_auth:
+            acc = await userbot_manager.get_account_info()
+            handle = f"@{acc.get('username')}" if acc and acc.get("username") else (acc.get("full_name") if acc else "ulangan")
+            status_note = f"📱 Akkaunt: <b>{handle}</b> (faol ✅)"
+        else:
+            status_note = "⚠️ <b>Userbot akkaunti ulanmagan!</b>\nAkkauntni ulash uchun /login yoki /account bosing."
+
         await bot.send_message(
             config.admin_id,
-            "♻️ Tizim qayta ishga tushdi.\n\n/menu",
+            f"♻️ <b>Tizim ishga tushdi</b>\n\n{status_note}\n\n/menu",
         )
     except Exception:
         logger.warning("Adminga xabar yuborib bo'lmadi (u botga /start bosmagan bo'lishi mumkin).")
 
     await dp.start_polling(bot, handle_signals=False)
+

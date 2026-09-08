@@ -77,20 +77,42 @@ Kerakli qiymatlar:
 python -m ai_userbot.main
 ```
 
-Birinchi ishga tushirishda Telethon telefon raqam va Telegramdan kelgan kodni so'raydi
-(bir marta) — so'ng `userbot.session` fayli yaratiladi.
+> [!TIP]
+> **Terminal orqali input talab qilinmaydi!**
+> Dastur ishga tushganda terminalda telefon raqam yoki kod kiritish shart emas. Barcha amallar bevosita Telegram Admin Botingiz orqali amalga oshiriladi.
+
+### 📱 Akkauntni Bot Orqali Ulash
+
+1. Admin botingizga kiring va `/start` yoki `/menu` buyrug'ini bosing.
+2. Menyudagi **`📱 Akkaunt`** (yoki `/login`) bo'limini tanlang.
+3. Telefon raqamingizni xalqaro formatda yuboring: `+998901234567`.
+4. **Tasdiqlash kodi va Telegram cheklovlari:**
+   Telegram xavfsizlik filtrlari 5 xonali login kodlarini botlarga yuborishda bloklashi yoki ogohlantirish berishi mumkin.
+   Shu sababli kodni raqamlar orasiga **nuqta yoki probel** qo'yib yuboring:
+   - Misol: `1.2.3.4.5` yoki `1 2 3 4 5`
+   - Bot avtomatik ravishda barcha belgilarni filtrlab, toza raqamlarni oladi.
+5. Agar akkauntingizda **2FA** (ikki bosqichli tekshiruv / Cloud Password) yoqilgan bo'lsa, bot parolingizni so'raydi (parol xavfsizlik uchun yuborilishi bilan darhol o'chiriladi).
+6. Akkaunt muvaffaqiyatli ulangach, Userbot avtomatik ravishda faollashadi va xabarlarga javob berishni boshlaydi!
 
 ## Admin bot menyusi (`/menu`)
 
+- 📱 **Akkaunt** — akkaunt holati (ulangan/ulanmagan), qayta tekshirish, akkauntni uzish (Logout)
 - 🤖 **AI holati** — javob berishni ON/OFF qilish
 - 💳 **Karta avto-javobi** — regex qatlamini butunlay o'chirish
+- ⏸ **Avto-pauza** — egasi o'zi yozayotganda bot aralashmasligi
 - 👥 **Ro'yxatlar** — kimga javob berishni boshqarish (pastda)
 - 📝 **Promptni tahrirlash** — `system_instruction` ni bevosita botdan yangilash
 - 💳 **Karta raqami** — regex qaytaradigan matnni o'zgartirish
 - 📊 **Statistika** — kunlik/haftalik hisobot, token sarfi, kalitlar
 - 🧹 **Kontekstni tozalash** — barcha suhbat xotirasini o'chirish
 
-Sozlama o'zgarishi bilan userbot **keyingi xabardayoq** yangi qiymatni bazadan o'qiydi.
+Bot buyruqlari:
+- `/menu` — Boshqaruv paneli
+- `/account` — Akkaunt holati va sozlamalari
+- `/login` — Akkauntni ulash
+- `/logout` — Akkauntni uzish
+- `/start` — Botni qayta boshlash
+
 
 ## 👥 Kimga javob berish (oq / qora ro'yxat)
 
@@ -108,26 +130,37 @@ Izoh qo'shsa ham bo'ladi: `123456789 aka`.
 
 **Javob berilmagan xabarlar ham arxivga tushadi** — filtr javobni to'xtatadi, yozuvni emas.
 
-## 📁 Maxfiy arxiv kanali
+## 📁 Maxfiy arxiv kanali va Anti-Delete Tizimi
 
 Mijoz xabarini o'chirsa, suhbatni tozalasa yoki akkaunt bloklansa — yozishmalar yo'qoladi.
-Har bir almashinuv ikki joyga yoziladi: **bazaga** (`messages` jadvali, 90 kun saqlanadi)
-va **maxfiy kanalga**.
+Tizim har bir kiruvchi va chiquvchi xabarni **millisekundlarda** ikki joyga yozadi: **bazaga** (`messages` jadvali, 90 kun saqlanadi) va **maxfiy kanalga**.
 
-Sozlash:
+### 🛡 Anti-Delete xususiyatlari:
+1. **To'liq foydalanuvchi profili:** Ism, `@username`, raqamli ID, telefon raqami (ochiq bo'lsa), va `⭐ Telegram Premium` belgisi.
+2. **Xabar tafsilotlari:** Xabar ID si (`#12345`), yuborilgan aniq vaqti (soniyasigacha) va media turi (`[📷 Rasm]`, `[🎤 Ovozli]`, `[📹 Video]` va h.k.).
+3. **O'chirilgan xabarlarni tutib olish:** Foydalanuvchi "Delete for everyone" qilib xabarni o'chirgan zahoti, kanalga alohida ogohlantirish yuboriladi:
+   ```text
+   🗑 DIQQAT: XABAR O'CHIRILDI!
+   👤 Ali Valiyev (@aka_ali)
+   123456789 · ochish · 21:47:05 #555
+   📞 Telefon: +998901234567
 
-1. Telegramda yopiq kanal yarating
-2. Admin botingizni kanalga **admin** qilib qo'shing (post yuborish huquqi bilan)
-3. Kanal ID sini oling ([@getmyid_bot](https://t.me/getmyid_bot)) va `.env` ga yozing:
-   `LOG_CHANNEL_ID=-1001234567890`
+   ❌ O'chirilgan xabar matni:
+   "Salom, narxlar qanaqa edi?"
+   ```
 
-`LOG_CHANNEL_ID` bo'sh bo'lsa kanal arxivi o'chiq qoladi, baza baribir yozib boradi.
+### 🧠 Avto-pauza va AI Kontekst Xotirasi
+Siz Telegramda o'zingiz xabar yozayotgan paytda (avto-pauza yoqilganda):
+- Mijozning kelgan xabarlari avtomatik Gemini kontekstiga qo'shiladi;
+- Sizning shaxsan o'zingiz yozgan javoblaringiz ham AIning xotirasiga olinadi;
+- Natijada siz oflayn bo'lib, AI qayta ishga tushganda, u siz nima deb gaplashganingizni to'liq bilgan holda suhbatni uzluksiz davom ettiradi.
 
-Kanaldagi yozuv:
+Kanaldagi oddiy yozuv:
 
 ```text
-👤 Ali Valiyev (@aka_ali) 🆕
-555 · ochish · 28.08 20:09
+👤 Ali Valiyev (@aka_ali) 🆕 ⭐ Premium
+123456789 · ochish · 28.08 20:09:15 #555
+📞 Telefon: +998901234567
 
 💬 Mijoz:
 kartangizni yuboring
@@ -135,10 +168,6 @@ kartangizni yuboring
 ⚡️ Regex:
 8600 1111 2222 3333
 ```
-
-Yuborish alohida navbat orqali ketadi — userbot kanalni kutib turmaydi. Telegram
-flood-limiti (`RetryAfter`) avtomatik hisobga olinadi, navbat to'lib ketsa eski
-yozuvlar tashlanadi (baza baribir saqlaydi).
 
 ## 📊 Statistika
 

@@ -22,7 +22,8 @@ from .admin_bot.bot import create_bot, create_dispatcher, run_admin_bot  # noqa:
 from .config import config  # noqa: E402
 from .database import init_db  # noqa: E402
 from .services.archive import archive_service  # noqa: E402
-from .userbot.client import create_client, run_userbot  # noqa: E402
+from .userbot.client import run_userbot  # noqa: E402
+from .userbot.manager import userbot_manager  # noqa: E402
 
 logger = logging.getLogger("ai_userbot")
 
@@ -44,19 +45,17 @@ async def main() -> None:
 
     await init_db()
 
-    userbot = create_client()
     bot = create_bot()
     dp = create_dispatcher()
 
-    # Arxiv kanalini userbot o'zi yaratadi/tiklaydi — `run_userbot()` ichida,
-    # akkaunt Telegramga ulangandan keyin.
+    # Userbot va Admin bot bitta event loopda parallel ishlaydi.
+    # Terminalda hech qanday input so'ralmaydi — akkaunt admin bot orqali ulanadi.
     tasks = [
-        asyncio.create_task(run_userbot(userbot), name="userbot"),
+        asyncio.create_task(run_userbot(), name="userbot"),
         asyncio.create_task(run_admin_bot(bot, dp), name="admin_bot"),
     ]
 
     try:
-        # Biri to'xtasa (yoki xato bersa) — ikkinchisini ham to'xtatamiz.
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for task in done:
             if task.exception() is not None:
@@ -69,11 +68,10 @@ async def main() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        await userbot_manager.close()
         await archive_service.close()
         await dp.storage.close()
         await bot.session.close()
-        if userbot.is_connected():
-            await userbot.disconnect()
         logger.info("Barcha ulanishlar yopildi. Xayr! 👋")
 
 

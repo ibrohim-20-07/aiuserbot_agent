@@ -209,8 +209,36 @@ class GeminiService:
         history.append(self._content("user", user_text))
         history.append(self._content("model", bot_text))
 
+    def remember_user(self, user_id: int, user_text: str) -> None:
+        """Foydalanuvchi yuborgan xabarni (masalan, avto-pauzada) xotiraga yozadi."""
+        if not user_text:
+            return
+        self._history[user_id].append(self._content("user", user_text))
+
+    def remember_reply(self, user_id: int, reply_text: str) -> None:
+        """Egasi yoki assistent yozgan javobni xotiraga yozadi."""
+        if not reply_text:
+            return
+        self._history[user_id].append(self._content("model", reply_text))
+
     def history_size(self, user_id: int) -> int:
         return len(self._history[user_id])
+
+    def get_context_stats(self) -> dict[str, int]:
+        """Kontekst xotirasi statistikasini qaytaradi."""
+        active_users = len(self._history)
+        total_messages = sum(len(d) for d in self._history.values())
+        return {
+            "active_users": active_users,
+            "total_messages": total_messages,
+            "history_limit": self.history_limit,
+        }
+
+    def set_history_limit(self, limit: int) -> None:
+        """Kontekst xabarlar chegarasini o'zgartiradi va mavjud navbatlarni yangilaydi."""
+        self.history_limit = max(2, limit)
+        for user_id, old_deque in list(self._history.items()):
+            self._history[user_id] = deque(old_deque, maxlen=self.history_limit)
 
     # ------------------------------------------------------------------ #
     # Asosiy so'rov
@@ -222,6 +250,18 @@ class GeminiService:
         system_instruction: str,
     ) -> str | None:
         """Foydalanuvchi xabariga javob matnini qaytaradi (xato bo'lsa `None`)."""
+        # Agar xotira bo'sh bo'lsa, bazadan oxirgi suhbat tarixini olib tiklaymiz
+        if len(self._history[user_id]) == 0:
+            try:
+                from ..database import get_history_limit, get_recent_messages
+
+                self.history_limit = await get_history_limit()
+                recent = await get_recent_messages(user_id, limit=self.history_limit)
+                for item in recent:
+                    self._history[user_id].append(self._content(item["role"], item["text"]))
+            except Exception:
+                logger.debug("Bazadan kontekstni tiklashda xatolik:", exc_info=True)
+
         history = self._history[user_id]
         user_message = self._content("user", text)
         contents = [*history, user_message]
@@ -231,6 +271,28 @@ class GeminiService:
             max_output_tokens=self.max_output_tokens,
             temperature=0.7,
             thinking_config=self._thinking_config(),
+            safety_settings=[
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                    threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                    threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                    threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                ),
+                types.SafetySetting(
+                    category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+                    threshold=types.HarmBlockThreshold.BLOCK_ONLY_HIGH,
+                ),
+            ],
         )
 
         attempts = len(self.api_keys)
@@ -284,11 +346,19 @@ class GeminiService:
                 await asyncio.sleep(RETRY_SLEEP)
                 continue
 
-            answer = (response.text or "").strip()
+            try:
+                answer = (response.text or "").strip()
+            except Exception as e:
+                logger.warning("Gemini javob matnini o'qib bo'lmadi (ehtimol xavfsizlik filtri): %s", e)
+                answer = ""
+
             finish = next(
                 (c.finish_reason for c in (response.candidates or []) if c.finish_reason),
                 None,
             )
+            if finish and "SAFETY" in str(finish):
+                logger.warning("Gemini xavfsizlik filtri (SAFETY) sababli javob bloklandi.")
+                return None
             if finish and "MAX_TOKENS" in str(finish):
                 logger.warning(
                     "Javob MAX_TOKENS bilan kesildi — MAX_OUTPUT_TOKENS (%s) ni oshiring.",

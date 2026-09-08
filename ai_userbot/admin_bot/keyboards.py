@@ -18,6 +18,13 @@ class CB:
     RESET_CONTEXT = "reset_context"
     CANCEL = "cancel"
 
+    # Akkaunt (Userbot)
+    ACCOUNT = "account"
+    ACCOUNT_CONNECT = "acc_connect"
+    ACCOUNT_REFRESH = "acc_refresh"
+    ACCOUNT_LOGOUT = "acc_logout"
+    ACCOUNT_LOGOUT_CONFIRM = "acc_logout_confirm"
+
     # Avto-pauza
     PAUSE = "pause"
     PAUSE_TOGGLE = "pause_toggle"
@@ -42,10 +49,12 @@ def main_menu(
     card_regex_active: bool,
     mode_label: str,
     pause_label: str = "o'chiq",
+    account_label: str = "o'chiq 🔴",
 ) -> InlineKeyboardMarkup:
     state = "🟢 YONIQ" if ai_active else "🔴 O'CHIQ"
     card_state = "🟢" if card_regex_active else "🔴"
     builder = InlineKeyboardBuilder()
+    builder.button(text=f"📱 Akkaunt: {account_label}", callback_data=CB.ACCOUNT)
     builder.button(text=f"🤖 AI holati: {state}", callback_data=CB.TOGGLE_AI)
     builder.button(
         text=f"{card_state} Karta avto-javobi (regex)",
@@ -57,7 +66,7 @@ def main_menu(
     builder.button(text="💳 Karta raqami", callback_data=CB.EDIT_CARD)
     builder.button(text="📊 Statistika", callback_data=CB.STATS)
     builder.button(text="🧹 Kontekstni tozalash", callback_data=CB.RESET_CONTEXT)
-    builder.adjust(1, 1, 1, 1, 2, 2)
+    builder.adjust(1, 1, 1, 1, 1, 2, 2)
     return builder.as_markup()
 
 
@@ -128,3 +137,32 @@ def cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✖️ Bekor qilish", callback_data=CB.CANCEL)]]
     )
+
+
+def account_menu(is_authorized: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if is_authorized:
+        builder.button(text="🔄 Qayta tekshirish", callback_data=CB.ACCOUNT_REFRESH)
+        builder.button(text="🚪 Akkauntni uzish", callback_data=CB.ACCOUNT_LOGOUT)
+        builder.button(text="⬅️ Menyu", callback_data=CB.MENU)
+        builder.adjust(2, 1)
+    else:
+        builder.button(text="📲 Akkauntni ulash", callback_data=CB.ACCOUNT_CONNECT)
+        builder.button(text="⬅️ Menyu", callback_data=CB.MENU)
+        builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def confirm_logout_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Ha, akkauntni uzish", callback_data=CB.ACCOUNT_LOGOUT_CONFIRM)
+    builder.button(text="✖️ Yo'q, bekor qilish", callback_data=CB.ACCOUNT)
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def cancel_auth_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✖️ Bekor qilish", callback_data=CB.ACCOUNT)]]
+    )
+

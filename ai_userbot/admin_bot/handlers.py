@@ -1,14 +1,24 @@
-"""Admin bot handlerlari: sozlamalar, ro'yxatlar, prompt, karta, statistika."""
+"""Admin bot handlerlari: sozlamalar, ro'yxatlar, prompt, karta, statistika, akkaunt."""
 from __future__ import annotations
 
 import html
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+from telethon.errors import (
+    FloodWaitError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
 
 from ..config import config
 from ..database import (
@@ -40,10 +50,14 @@ from ..database import (
 from ..services.archive import archive_service
 from ..services.gemini_service import gemini_service
 from ..services.presence import presence_tracker
+from ..userbot.manager import userbot_manager
 from .keyboards import (
     CB,
+    account_menu,
     back_menu,
+    cancel_auth_menu,
     cancel_menu,
+    confirm_logout_menu,
     list_menu,
     lists_menu,
     main_menu,
@@ -68,6 +82,13 @@ class Settings(StatesGroup):
     list_del = State()
 
 
+class AuthStates(StatesGroup):
+    phone = State()
+    code = State()
+    password = State()
+
+
+
 def _clip(text: str) -> str:
     return text if len(text) <= MAX_PREVIEW else text[:MAX_PREVIEW] + "…"
 
@@ -85,6 +106,7 @@ def _menu_text(
     mode: str,
     pause_active: bool = False,
     pause_minutes: int = 10,
+    account_info: dict | None = None,
 ) -> str:
     state = "yoniq ✅" if ai_active else "o'chiq ⛔️"
     card_state = "yoniq ✅" if card_regex_active else "o'chiq ⛔️"
@@ -92,6 +114,17 @@ def _menu_text(
         pause_state = f"{pause_minutes} daq · {presence_tracker.describe(pause_minutes * 60)}"
     else:
         pause_state = "o'chiq ⛔️"
+
+    if account_info:
+        handle = (
+            f"@{_esc(account_info.get('username'))}"
+            if account_info.get("username")
+            else _esc(account_info.get("full_name") or account_info.get("id"))
+        )
+        acc_state = f"ulangan ✅ ({handle})"
+    else:
+        acc_state = "ulanmagan ⛔️"
+
     arch = archive_service.stats()
     if arch["enabled"]:
         link = arch.get("link")
@@ -99,15 +132,17 @@ def _menu_text(
         arch_state = f"yoniq ✅ ({arch['sent']} yozuv){opener}"
     else:
         arch_state = "o'chiq ⛔️"
+
     return (
         "<b>⚙️ Userbot boshqaruv paneli</b>\n\n"
-        f"AI javob berish: <b>{state}</b>\n"
-        f"Karta avto-javobi: <b>{card_state}</b>\n"
-        f"Avto-pauza: <b>{pause_state}</b>\n"
-        f"Javob rejimi: <b>{MODE_LABELS[mode]}</b>\n"
-        f"Arxiv kanali: <b>{arch_state}</b>\n"
-        f"Model: <code>{_esc(config.gemini_model)}</code>\n"
-        f"API kalitlar: <b>{len(config.gemini_api_keys)} ta</b>\n\n"
+        f"📱 Akkaunt: <b>{acc_state}</b>\n"
+        f"🤖 AI javob berish: <b>{state}</b>\n"
+        f"💳 Karta avto-javobi: <b>{card_state}</b>\n"
+        f"⏸ Avto-pauza: <b>{pause_state}</b>\n"
+        f"👥 Javob rejimi: <b>{MODE_LABELS[mode]}</b>\n"
+        f"📁 Arxiv kanali: <b>{arch_state}</b>\n"
+        f"🧠 Model: <code>{_esc(config.gemini_model)}</code>\n"
+        f"🔑 API kalitlar: <b>{len(config.gemini_api_keys)} ta</b>\n\n"
         "Kerakli bo'limni tanlang:"
     )
 
@@ -116,9 +151,11 @@ async def _show_menu(target: Message | CallbackQuery) -> None:
     """Menyuni yuboradi (xabar) yoki mavjudini yangilaydi (callback)."""
     ai, card, mode = await is_ai_active(), await is_card_regex_active(), await get_access_mode()
     pause, minutes = await is_auto_pause_active(), await get_auto_pause_minutes()
-    text = _menu_text(ai, card, mode, pause, minutes)
+    acc = await userbot_manager.get_account_info()
+    acc_label = f"🟢 @{acc['username'] or acc['id']}" if acc else "🔴 Ulanmagan"
+    text = _menu_text(ai, card, mode, pause, minutes, acc)
     markup = main_menu(
-        ai, card, MODE_LABELS[mode], f"{minutes} daq" if pause else "o'chiq"
+        ai, card, MODE_LABELS[mode], f"{minutes} daq" if pause else "o'chiq", acc_label
     )
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=markup)
@@ -144,6 +181,297 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await _show_menu(call)
     await call.answer("Bekor qilindi")
+
+
+# --------------------------------------------------------------------- #
+# 📱 Akkaunt boshqaruvi va Login
+# --------------------------------------------------------------------- #
+async def _account_view(target: Message | CallbackQuery) -> None:
+    acc = await userbot_manager.get_account_info()
+    if acc:
+        phone_txt = f"+{acc.get('phone')}" if acc.get("phone") else "Noma'lum"
+        user_handle = f"@{acc.get('username')}" if acc.get("username") else "mavjud emas"
+        text = (
+            "<b>📱 Telegram Akkaunt</b>\n\n"
+            f"• 👤 Ism: <b>{_esc(acc.get('full_name'))}</b>\n"
+            f"• 🔗 Username: <b>{_esc(user_handle)}</b>\n"
+            f"• 📞 Telefon: <code>{_esc(phone_txt)}</code>\n"
+            f"• 🆔 ID: <code>{acc.get('id')}</code>\n"
+            "• 🟢 Holat: <b>Ulangan va faol</b>\n\n"
+            "<i>Userbot mijozlar xabarlariga avtomatik javob berishga tayyor.</i>"
+        )
+        markup = account_menu(is_authorized=True)
+    else:
+        text = (
+            "<b>📱 Telegram Akkaunt</b>\n\n"
+            "🔴 <b>Akkaunt ulanmagan!</b>\n\n"
+            "Userbot shaxsiy xabarlarga avtomatik javob berishi uchun Telegram akkauntingizni ulang.\n\n"
+            "Ulash jarayoni (telefon kiritish, tasdiqlash kodi, 2FA) to'liq shu bot orqali "
+            "amalga oshiriladi — terminal kerak emas."
+        )
+        markup = account_menu(is_authorized=False)
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+@router.message(Command("account"))
+async def cmd_account(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _account_view(message)
+
+
+@router.callback_query(F.data == CB.ACCOUNT)
+async def cb_account(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _account_view(call)
+    await call.answer()
+
+
+@router.callback_query(F.data == CB.ACCOUNT_REFRESH)
+async def cb_account_refresh(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _account_view(call)
+    await call.answer("Holat yangilandi 🔄")
+
+
+@router.message(Command("login"))
+@router.callback_query(F.data == CB.ACCOUNT_CONNECT)
+async def cb_account_connect(target: Message | CallbackQuery, state: FSMContext) -> None:
+    if await userbot_manager.is_authorized():
+        msg = "Akkaunt allaqachon ulangan ✅"
+        if isinstance(target, CallbackQuery):
+            await target.answer(msg, show_alert=True)
+        else:
+            await target.answer(msg)
+        return
+
+    await state.set_state(AuthStates.phone)
+    text = (
+        "<b>📱 Telegram akkauntni ulash</b>\n\n"
+        "Ulanadigan akkauntingiz telefon raqamini xalqaro formatda yuboring:\n"
+        "Masalan: <code>+998901234567</code>\n\n"
+        "<i>Raqamga Telegram ilovasi orqali tasdiqlash kodi yuboriladi.</i>"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=cancel_auth_menu())
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=cancel_auth_menu())
+
+
+@router.message(StateFilter(AuthStates.phone), F.text)
+async def process_phone(message: Message, state: FSMContext) -> None:
+    raw_phone = message.text.strip()
+    status_msg = await message.answer("⏳ Telegramga so'rov yuborilmoqda...")
+
+    try:
+        phone_code_hash = await userbot_manager.send_code(raw_phone)
+    except PhoneNumberInvalidError:
+        await status_msg.delete()
+        await message.answer(
+            "❌ Telefon raqami noto'g'ri kiritildi.\n"
+            "Iltimos, xalqaro formatda yuboring (masalan: <code>+998901234567</code>):",
+            reply_markup=cancel_auth_menu(),
+        )
+        return
+    except PhoneNumberBannedError:
+        await status_msg.delete()
+        await state.clear()
+        await message.answer(
+            "🚫 Ushbu telefon raqam Telegram tomonidan bloklangan.",
+            reply_markup=back_menu(),
+        )
+        return
+    except FloodWaitError as exc:
+        await status_msg.delete()
+        await state.clear()
+        await message.answer(
+            f"⏳ Telegram cheklovi: Iltimos, {exc.seconds} soniya kuting.",
+            reply_markup=back_menu(),
+        )
+        return
+    except Exception as exc:
+        await status_msg.delete()
+        await message.answer(
+            f"❌ Xatolik yuz berdi: {_esc(exc)}\n"
+            "Telefon raqamini qaytadan tekshirib yuboring:",
+            reply_markup=cancel_auth_menu(),
+        )
+        return
+
+    await status_msg.delete()
+    await state.update_data(phone=userbot_manager.phone, phone_code_hash=phone_code_hash)
+    await state.set_state(AuthStates.code)
+
+    await message.answer(
+        "📩 <b>Tasdiqlash kodi yuborildi!</b>\n\n"
+        "Telegram ilovangizga (yoki SMS orqali) 5 xonali tasdiqlash kodi bordi.\n\n"
+        "⚠️ <b>MUHIM:</b> Telegram xavfsizlik cheklovlari (kodni yashirish/bloklash) sababli, "
+        "kodni raqamlari orasiga <b>nuqta yoki probel</b> qo'yib yuboring!\n\n"
+        "Misollar:\n"
+        "• <code>1.2.3.4.5</code>\n"
+        "• <code>1 2 3 4 5</code>\n"
+        "• <code>1-2-3-4-5</code>\n\n"
+        "<i>Tasdiqlash kodini yuboring:</i>",
+        reply_markup=cancel_auth_menu(),
+    )
+
+
+@router.message(StateFilter(AuthStates.code), F.text)
+async def process_code(message: Message, state: FSMContext) -> None:
+    raw_code = message.text.strip()
+    clean_code = "".join(re.findall(r"\d", raw_code))
+
+    if len(clean_code) < 5:
+        await message.answer(
+            "⚠️ Kod kamida 5 ta raqamdan iborat bo'lishi kerak.\n\n"
+            "Telegram cheklovlariga mos holatda kodni raqamlari orasiga "
+            "nuqta qo'yib yuboring (masalan: <code>1.2.3.4.5</code>):",
+            reply_markup=cancel_auth_menu(),
+        )
+        return
+
+    data = await state.get_data()
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+
+    status_msg = await message.answer("⏳ Kod tekshirilmoqda...")
+
+    try:
+        user_info = await userbot_manager.sign_in_with_code(
+            code=clean_code,
+            phone=phone,
+            phone_code_hash=phone_code_hash,
+        )
+        await status_msg.delete()
+        await state.clear()
+        phone_txt = f"+{user_info.get('phone')}" if user_info.get("phone") else ""
+        handle = f"@{user_info.get('username')}" if user_info.get("username") else "yo'q"
+        await message.answer(
+            "🎉 <b>Akkaunt muvaffaqiyatli ulandi!</b>\n\n"
+            f"• 👤 Ism: <b>{_esc(user_info.get('full_name'))}</b>\n"
+            f"• 🔗 Username: <b>{_esc(handle)}</b>\n"
+            f"• 📞 Telefon: <code>{_esc(phone_txt)}</code>\n"
+            f"• 🆔 ID: <code>{user_info.get('id')}</code>\n\n"
+            "Userbot faollashdi va xabarlarga avtomatik javob berishni boshladi! 🚀",
+            reply_markup=back_menu(),
+        )
+    except SessionPasswordNeededError:
+        await status_msg.delete()
+        await state.set_state(AuthStates.password)
+        await message.answer(
+            "🔐 <b>Ikki bosqichli tekshiruv (2FA) yoqilgan!</b>\n\n"
+            "Ushbu akkauntda bulutli parol (Cloud Password) o'rnatilgan.\n"
+            "Iltimos, 2FA parolingizni yuboring.\n\n"
+            "<i>Xavfsizlik uchun yuborgan xabaringiz darhol o'chiriladi.</i>",
+            reply_markup=cancel_auth_menu(),
+        )
+    except PhoneCodeInvalidError:
+        await status_msg.delete()
+        await message.answer(
+            "❌ Tasdiqlash kodi noto'g'ri!\n"
+            "Iltimos, qaytadan tekshirib formatlangan holda yuboring (masalan: <code>1.2.3.4.5</code>):",
+            reply_markup=cancel_auth_menu(),
+        )
+    except PhoneCodeExpiredError:
+        await status_msg.delete()
+        await state.clear()
+        await message.answer(
+            "⏱ Tasdiqlash kodining muddati tugadi. Iltimos, akkauntni ulashni qaytadan boshlang.",
+            reply_markup=back_menu(),
+        )
+    except FloodWaitError as exc:
+        await status_msg.delete()
+        await state.clear()
+        await message.answer(
+            f"⏳ Telegram cheklovi: Iltimos, {exc.seconds} soniya kuting.",
+            reply_markup=back_menu(),
+        )
+    except Exception as exc:
+        await status_msg.delete()
+        await message.answer(
+            f"❌ Xatolik yuz berdi: {_esc(exc)}\n"
+            "Kodni qaytadan tekshirib yuboring (masalan: <code>1.2.3.4.5</code>):",
+            reply_markup=cancel_auth_menu(),
+        )
+
+
+@router.message(StateFilter(AuthStates.password), F.text)
+async def process_password(message: Message, state: FSMContext) -> None:
+    password = message.text.strip()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    status_msg = await message.answer("⏳ 2FA paroli tekshirilmoqda...")
+
+    try:
+        user_info = await userbot_manager.sign_in_with_password(password)
+        await status_msg.delete()
+        await state.clear()
+        phone_txt = f"+{user_info.get('phone')}" if user_info.get("phone") else ""
+        handle = f"@{user_info.get('username')}" if user_info.get("username") else "yo'q"
+        await message.answer(
+            "🎉 <b>Akkaunt muvaffaqiyatli ulandi!</b>\n\n"
+            f"• 👤 Ism: <b>{_esc(user_info.get('full_name'))}</b>\n"
+            f"• 🔗 Username: <b>{_esc(handle)}</b>\n"
+            f"• 📞 Telefon: <code>{_esc(phone_txt)}</code>\n"
+            f"• 🆔 ID: <code>{user_info.get('id')}</code>\n\n"
+            "Userbot faollashdi va xabarlarga avtomatik javob berishni boshladi! 🚀",
+            reply_markup=back_menu(),
+        )
+    except PasswordHashInvalidError:
+        await status_msg.delete()
+        await message.answer(
+            "❌ 2FA paroli noto'g'ri. Iltimos, parolingizni qaytadan kiriting:",
+            reply_markup=cancel_auth_menu(),
+        )
+    except FloodWaitError as exc:
+        await status_msg.delete()
+        await state.clear()
+        await message.answer(
+            f"⏳ Telegram cheklovi: Iltimos, {exc.seconds} soniya kuting.",
+            reply_markup=back_menu(),
+        )
+    except Exception as exc:
+        await status_msg.delete()
+        await message.answer(
+            f"❌ Xatolik yuz berdi: {_esc(exc)}\nQaytadan urinib ko'ring:",
+            reply_markup=cancel_auth_menu(),
+        )
+
+
+@router.message(Command("logout"))
+@router.callback_query(F.data == CB.ACCOUNT_LOGOUT)
+async def cb_account_logout(target: Message | CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text = (
+        "⚠️ <b>Akkauntni uzishni tasdiqlaysizmi?</b>\n\n"
+        "Chiqsangiz, userbot faoliyati to'xtaydi va yangi akkaunt ulanmagunicha "
+        "mijozlar xabarlariga avtomatik javob berilmaydi.\n\n"
+        "Haqiqatan ham chiqmoqchimisiz?"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=confirm_logout_menu())
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=confirm_logout_menu())
+
+
+@router.callback_query(F.data == CB.ACCOUNT_LOGOUT_CONFIRM)
+async def cb_account_logout_confirm(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    success = await userbot_manager.logout()
+    if success:
+        await call.answer("Akkaunt muvaffaqiyatli uzildi", show_alert=True)
+    else:
+        await call.answer("Akkaunt uzildi (xatolar bilan)", show_alert=True)
+    await _account_view(call)
+
 
 
 # --------------------------------------------------------------------- #
@@ -423,7 +751,17 @@ async def set_card(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Karta ma'lumotlari yangilandi.", reply_markup=back_menu())
 
 
-@router.message(StateFilter(Settings.prompt, Settings.card, Settings.list_add, Settings.list_del))
+@router.message(
+    StateFilter(
+        Settings.prompt,
+        Settings.card,
+        Settings.list_add,
+        Settings.list_del,
+        AuthStates.phone,
+        AuthStates.code,
+        AuthStates.password,
+    )
+)
 async def wrong_input(message: Message) -> None:
     await message.answer("⚠️ Faqat matn yuboring.", reply_markup=cancel_menu())
 

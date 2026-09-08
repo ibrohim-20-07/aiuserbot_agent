@@ -1,0 +1,11 @@
+# Telegram
+telethon>=1.36.0        # userbot (shaxsiy akkaunt)
+aiogram>=3.13.0         # admin bot
+
+# AI
+google-genai>=1.0.0     # Gemini 2.5 Flash (yangi Google GenAI SDK)
+
+# Infratuzilma
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1
+tzdata>=2024.1          # Windows'da kvota reset vaqtini hisoblash uchun
